@@ -10,19 +10,25 @@ import {
   removeWorkspace,
   indexWorkspace,
   searchWorkspace,
+  checkWorkspaceStaleness,
+  getCompositeWorkspaceHash,
   closeAllDatabases
 } from '../src/index.js';
+import { reorderLostInTheMiddle, formatContextEnvelopes } from '../src/services/ragEngine.js';
 
-describe('Kensaku Semantic Search Engine', () => {
-  let tempWorkspace;
-  const testCategory = 'test_workspace_' + Date.now();
+describe('Kensaku Semantic Search & RAG Engine', () => {
+  let tempWorkspace1;
+  let tempWorkspace2;
+  const testCategory1 = 'test_cat1_' + Date.now();
+  const testCategory2 = 'test_cat2_' + Date.now();
 
   before(async () => {
-    tempWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), 'kensaku-test-'));
+    tempWorkspace1 = await fs.mkdtemp(path.join(os.tmpdir(), 'kensaku-test1-'));
+    tempWorkspace2 = await fs.mkdtemp(path.join(os.tmpdir(), 'kensaku-test2-'));
 
-    // Create sample markdown documents
+    // Create sample markdown documents in workspace 1 (Architecture & DB)
     await fs.writeFile(
-      path.join(tempWorkspace, 'architecture.md'),
+      path.join(tempWorkspace1, 'architecture.md'),
       `# System Architecture
 
 ## Overview
@@ -36,17 +42,15 @@ FTS5 full-text indexing enables authentic BM25 lexical ranking.
       'utf8'
     );
 
+    // Create sample markdown documents in workspace 2 (Cooking & Recipes)
     await fs.writeFile(
-      path.join(tempWorkspace, 'ai_research.md'),
-      `# Frontier AI Research 2026
+      path.join(tempWorkspace2, 'carbonara.md'),
+      `# Traditional Italian Cuisine
 
-## Transformer Models
-Recent breakthroughs in quantized small language models enable high-performance edge inference.
-ONNX runtime accelerates local execution without GPU requirements.
-
-## Mathematical Formulations
-Attention mechanisms scale with sequence length according to the formula:
-Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
+## Spaghetti alla Carbonara
+To prepare classic Roman Carbonara, you need guanciale, fresh pecorino romano cheese, eggs, and black pepper.
+Never use cream or garlic in an authentic Roman recipe.
+Slowly render the guanciale until crispy before tossing with the al dente pasta.
 `,
       'utf8'
     );
@@ -54,9 +58,11 @@ Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
 
   after(async () => {
     closeAllDatabases();
-    removeWorkspace(testCategory);
+    removeWorkspace(testCategory1);
+    removeWorkspace(testCategory2);
     try {
-      await fs.rm(tempWorkspace, { recursive: true, force: true });
+      await fs.rm(tempWorkspace1, { recursive: true, force: true });
+      await fs.rm(tempWorkspace2, { recursive: true, force: true });
     } catch {}
   });
 
@@ -85,30 +91,72 @@ Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
     assert.strictEqual(batch[0].length, 384);
   });
 
-  it('indexes a workspace category and executes hybrid search with RRF', async () => {
-    addWorkspace(testCategory, tempWorkspace);
+  it('indexes multiple workspaces and verifies composite hashing and staleness detection', async () => {
+    addWorkspace(testCategory1, tempWorkspace1);
+    addWorkspace(testCategory2, tempWorkspace2);
 
-    const indexRes = await indexWorkspace(testCategory, { rootDir: tempWorkspace });
-    assert.strictEqual(indexRes.scanned, 2);
-    assert.ok(indexRes.updated >= 2);
-    assert.ok(indexRes.totalChunks >= 4);
+    const indexRes1 = await indexWorkspace(testCategory1, { rootDir: tempWorkspace1 });
+    assert.strictEqual(indexRes1.scanned, 1);
+    assert.ok(indexRes1.updated >= 1);
+    assert.ok(indexRes1.compositeHash.length === 64);
 
-    // Incremental index test (nothing changed)
-    const incRes = await indexWorkspace(testCategory, { rootDir: tempWorkspace });
-    assert.strictEqual(incRes.scanned, 2);
-    assert.strictEqual(incRes.updated, 0);
-    assert.strictEqual(incRes.unchanged, 2);
+    const indexRes2 = await indexWorkspace(testCategory2, { rootDir: tempWorkspace2 });
+    assert.strictEqual(indexRes2.scanned, 1);
+    assert.ok(indexRes2.compositeHash.length === 64);
 
-    // Semantic search query
-    const searchRes = await searchWorkspace(testCategory, 'vector database and sqlite storage', { limit: 3 });
-    assert.ok(searchRes.results.length > 0);
-    assert.strictEqual(searchRes.results[0].docPath, 'architecture.md');
-    assert.ok(searchRes.results[0].score > 0);
-    assert.ok(searchRes.results[0].lineStart > 0);
+    // Initial staleness check: should NOT be stale
+    const staleCheck1 = await checkWorkspaceStaleness(testCategory1);
+    assert.strictEqual(staleCheck1.isStale, false);
+    assert.strictEqual(staleCheck1.compositeHash, indexRes1.compositeHash);
 
-    // AI research query
-    const aiRes = await searchWorkspace(testCategory, 'quantized transformer edge inference', { limit: 3 });
-    assert.ok(aiRes.results.length > 0);
-    assert.strictEqual(aiRes.results[0].docPath, 'ai_research.md');
+    // Modify a file: should become stale
+    await fs.appendFile(path.join(tempWorkspace1, 'architecture.md'), '\n## Cache Layer\nRedis cache in-memory.\n');
+    const staleCheckAfterMod = await checkWorkspaceStaleness(testCategory1);
+    assert.strictEqual(staleCheckAfterMod.isStale, true);
+    assert.strictEqual(staleCheckAfterMod.modifiedFiles.length, 1);
+
+    // Re-index should clear staleness and update composite hash
+    const reindexRes = await indexWorkspace(testCategory1, { rootDir: tempWorkspace1 });
+    assert.strictEqual(reindexRes.updated, 1);
+    assert.notStrictEqual(reindexRes.compositeHash, indexRes1.compositeHash);
+
+    const staleCheckAfterReindex = await checkWorkspaceStaleness(testCategory1);
+    assert.strictEqual(staleCheckAfterReindex.isStale, false);
+  });
+
+  it('searches across ALL registered workspaces simultaneously with global ranking', async () => {
+    // Search across all workspaces
+    const globalRes = await searchWorkspace('all', 'authentic roman guanciale recipe', { limit: 5 });
+    assert.ok(globalRes.results.length > 0);
+    assert.strictEqual(globalRes.results[0].workspace, testCategory2);
+    assert.strictEqual(globalRes.results[0].docPath, 'carbonara.md');
+
+    // Search for tech architecture across all workspaces
+    const techRes = await searchWorkspace('all', 'sqlite and dense vector extension', { limit: 5 });
+    assert.ok(techRes.results.length > 0);
+    assert.strictEqual(techRes.results[0].workspace, testCategory1);
+    assert.strictEqual(techRes.results[0].docPath, 'architecture.md');
+  });
+
+  it('implements Lost-in-the-Middle context reordering and XML envelope formatting', () => {
+    const mockChunks = [
+      { id: 1, docPath: 'a.md', lineStart: 1, lineEnd: 10, content: 'Chunk A (Best)', score: 0.95 },
+      { id: 2, docPath: 'b.md', lineStart: 1, lineEnd: 10, content: 'Chunk B (Second)', score: 0.85 },
+      { id: 3, docPath: 'c.md', lineStart: 1, lineEnd: 10, content: 'Chunk C (Third)', score: 0.75 },
+      { id: 4, docPath: 'd.md', lineStart: 1, lineEnd: 10, content: 'Chunk D (Fourth)', score: 0.65 }
+    ];
+
+    const reordered = reorderLostInTheMiddle(mockChunks);
+    assert.strictEqual(reordered.length, 4);
+    // Highest score at beginning
+    assert.strictEqual(reordered[0].id, 1);
+    // Second highest at the end (Lost-in-the-Middle mitigation)
+    assert.strictEqual(reordered[3].id, 2);
+
+    const envelopes = formatContextEnvelopes(reordered);
+    assert.ok(envelopes.includes('<context>'));
+    assert.ok(envelopes.includes('<document id="1"'));
+    assert.ok(envelopes.includes('Chunk A (Best)'));
+    assert.ok(envelopes.includes('</context>'));
   });
 });

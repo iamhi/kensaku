@@ -2,6 +2,55 @@ import { embedText } from '../pipeline/embeddings.js';
 import { knnSearch, bm25Search, getChunksByIds } from '../db/sqliteManager.js';
 
 const RRF_K = 60; // Standard Reciprocal Rank Fusion constant
+const MIN_SIMILARITY_THRESHOLD = 0.25; // Noise floor for dense embeddings
+
+/**
+ * Merges adjacent or overlapping chunks from the same document with proximity boost.
+ * @param {Array<object>} hits
+ * @param {number} [proximityLines=5]
+ * @returns {Array<object>}
+ */
+export function mergeNearbyChunks(hits, proximityLines = 5) {
+  if (!hits || hits.length <= 1) return hits || [];
+
+  // Group by workspace:docPath
+  const byDoc = new Map();
+  for (const hit of hits) {
+    const key = `${hit.workspace || 'default'}::${hit.docPath}`;
+    const list = byDoc.get(key) || [];
+    list.push({ ...hit });
+    byDoc.set(key, list);
+  }
+
+  const mergedResults = [];
+
+  for (const docHits of byDoc.values()) {
+    // Sort chronologically by start line
+    docHits.sort((a, b) => a.lineStart - b.lineStart);
+    let current = docHits[0];
+
+    for (let i = 1; i < docHits.length; i++) {
+      const next = docHits[i];
+      if (next.lineStart <= current.lineEnd + proximityLines) {
+        // Contiguous / overlapping chunks: extend line boundaries
+        current.lineEnd = Math.max(current.lineEnd, next.lineEnd);
+        current.content = `${current.content}\n\n---\n\n${next.content}`;
+        if (current.section !== next.section && !current.section.includes(next.section)) {
+          current.section = `${current.section} & ${next.section}`;
+        }
+        // Controlled proximity score accumulation
+        current.score = Number((Math.max(current.score, next.score) + 0.15 * Math.min(current.score, next.score)).toFixed(5));
+        current.denseScore = Math.max(current.denseScore, next.denseScore);
+      } else {
+        mergedResults.push(current);
+        current = next;
+      }
+    }
+    mergedResults.push(current);
+  }
+
+  return mergedResults.sort((a, b) => b.score - a.score);
+}
 
 /**
  * Executes a hybrid (Dense Vector KNN + Sparse FTS5 BM25) search with Reciprocal Rank Fusion (RRF).
@@ -10,6 +59,7 @@ const RRF_K = 60; // Standard Reciprocal Rank Fusion constant
  * @param {object} [options]
  * @param {number} [options.limit=10] - Number of final chunks to return.
  * @param {number} [options.candidateLimit=30] - Candidate pool size for fusion.
+ * @param {boolean} [options.mergeProximity=true] - Whether to merge nearby chunks.
  * @returns {Promise<{ query: string, category: string, count: number, results: Array<object> }>}
  */
 export async function hybridSearch(category, query, options = {}) {
@@ -28,15 +78,22 @@ export async function hybridSearch(category, query, options = {}) {
   const knnResults = knnSearch(category, queryVector, candidateLimit);
   const bm25Results = bm25Search(category, cleanQuery, candidateLimit);
 
-  // 3. Reciprocal Rank Fusion (RRF)
+  // 3. Reciprocal Rank Fusion (RRF) with similarity calibration
   const scores = new Map(); // chunkId -> { rrfScore, denseScore, bm25Score, denseRank, bm25Rank }
 
-  // Process Dense KNN ranks
+  // Process Dense KNN ranks with similarity gating
   knnResults.forEach((item, index) => {
     const rank = index + 1;
     // Cosine distance to similarity: 1 - distance
     const similarity = Math.max(0, 1 - (item.distance || 0));
-    const rrfContrib = 1.0 / (RRF_K + rank);
+
+    // Exclude noise hits below similarity threshold unless they also match lexical BM25
+    if (similarity < MIN_SIMILARITY_THRESHOLD) {
+      return;
+    }
+
+    // Similarity-scaled RRF to solve cross-collection rank disparity
+    const rrfContrib = similarity / (RRF_K + rank);
 
     scores.set(item.chunkId, {
       chunkId: item.chunkId,
@@ -76,19 +133,20 @@ export async function hybridSearch(category, query, options = {}) {
 
   // Sort candidate chunk IDs by fused RRF score descending
   const sortedEntries = Array.from(scores.values()).sort((a, b) => b.rrfScore - a.rrfScore);
-  const topEntries = sortedEntries.slice(0, limit);
+  const topEntries = sortedEntries.slice(0, candidateLimit);
   const topIds = topEntries.map((e) => e.chunkId);
 
   // 4. Hydrate chunk records
   const chunksMap = getChunksByIds(category, topIds);
 
-  const results = [];
+  const candidates = [];
   for (const entry of topEntries) {
     const chunk = chunksMap.get(entry.chunkId);
     if (!chunk) continue;
 
-    results.push({
+    candidates.push({
       id: chunk.id,
+      workspace: chunk.category || category,
       docPath: chunk.doc_path,
       title: chunk.title,
       section: chunk.section,
@@ -102,10 +160,60 @@ export async function hybridSearch(category, query, options = {}) {
     });
   }
 
+  // 5. Optional Proximity Merge
+  const finalResults = options.mergeProximity !== false
+    ? mergeNearbyChunks(candidates, 5).slice(0, limit)
+    : candidates.slice(0, limit);
+
   return {
     query: cleanQuery,
     category,
-    count: results.length,
-    results
+    count: finalResults.length,
+    results: finalResults
+  };
+}
+
+/**
+ * Searches across multiple workspaces in parallel, merging and ranking results globally.
+ * @param {string[]} categories - Array of workspace category names.
+ * @param {string} query - Search query text.
+ * @param {object} [options]
+ * @returns {Promise<{ query: string, category: string, count: number, results: Array<object> }>}
+ */
+export async function searchMultipleWorkspaces(categories, query, options = {}) {
+  const limit = options.limit || 10;
+  if (!categories || categories.length === 0) {
+    return { query, category: 'all', count: 0, results: [] };
+  }
+
+  // Execute in parallel
+  const searchPromises = categories.map((cat) =>
+    hybridSearch(cat, query, { ...options, limit: limit * 2 })
+      .catch((err) => {
+        console.warn(`[Kensaku] Search failed for workspace "${cat}":`, err.message);
+        return { results: [] };
+      })
+  );
+
+  const searchResponses = await Promise.all(searchPromises);
+  const allHits = [];
+
+  for (const resp of searchResponses) {
+    allHits.push(...(resp.results || []));
+  }
+
+  // Sort merged results by fused score descending
+  allHits.sort((a, b) => b.score - a.score);
+
+  // Apply proximity merge across documents
+  const merged = options.mergeProximity !== false
+    ? mergeNearbyChunks(allHits, 5).slice(0, limit)
+    : allHits.slice(0, limit);
+
+  return {
+    query,
+    category: categories.length === 1 ? categories[0] : 'all',
+    count: merged.length,
+    results: merged
   };
 }

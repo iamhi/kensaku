@@ -10,13 +10,17 @@ import {
   getWorkspacesRegistry,
   getDocumentRecord,
   getAllDocumentRecords,
+  getDocumentsStatMap,
+  getCompositeWorkspaceHash,
   deleteDocumentChunks,
   upsertDocumentWithChunks,
   getCategoryStats,
   closeDatabase,
   closeAllDatabases
 } from './db/sqliteManager.js';
-import { hybridSearch } from './services/searchEngine.js';
+import { hybridSearch, searchMultipleWorkspaces } from './services/searchEngine.js';
+import { executeRAG } from './services/ragEngine.js';
+import { checkLLMHealth } from './services/llmClient.js';
 
 /**
  * Recursively scans directory for markdown files.
@@ -113,6 +117,61 @@ export function listWorkspaces() {
 }
 
 /**
+ * Quickly checks if a workspace has modified, added, or deleted files without embedding.
+ * Uses mtime and file listing comparison for sub-millisecond detection.
+ * @param {string} category
+ * @returns {Promise<{ isStale: boolean, newFiles: string[], modifiedFiles: string[], deletedFiles: string[], compositeHash: string }>}
+ */
+export async function checkWorkspaceStaleness(category) {
+  const normCategory = (category || 'default').trim().toLowerCase();
+  const registry = getWorkspacesRegistry();
+  const rootDir = registry[normCategory]?.path;
+
+  if (!rootDir || !existsSync(rootDir)) {
+    return { isStale: false, newFiles: [], modifiedFiles: [], deletedFiles: [], compositeHash: '' };
+  }
+
+  const ig = await loadGitIgnore(rootDir);
+  const discoveredFiles = await scanMarkdownFiles(rootDir, rootDir, ig);
+  const statMap = getDocumentsStatMap(normCategory);
+
+  const newFiles = [];
+  const modifiedFiles = [];
+  const discoveredSet = new Set(discoveredFiles);
+
+  for (const relPath of discoveredFiles) {
+    const fullPath = path.join(rootDir, relPath);
+    try {
+      const stat = await fs.stat(fullPath);
+      const existing = statMap.get(relPath);
+      if (!existing) {
+        newFiles.push(relPath);
+      } else if (Math.floor(stat.mtimeMs) !== Math.floor(existing.mtime)) {
+        modifiedFiles.push(relPath);
+      }
+    } catch {}
+  }
+
+  const deletedFiles = [];
+  for (const recordedPath of statMap.keys()) {
+    if (!discoveredSet.has(recordedPath)) {
+      deletedFiles.push(recordedPath);
+    }
+  }
+
+  const isStale = newFiles.length > 0 || modifiedFiles.length > 0 || deletedFiles.length > 0;
+  const compositeHash = getCompositeWorkspaceHash(normCategory);
+
+  return {
+    isStale,
+    newFiles,
+    modifiedFiles,
+    deletedFiles,
+    compositeHash
+  };
+}
+
+/**
  * Indexes a workspace category with SHA-256 incremental hashing.
  * Only modified or new files are chunked and embedded.
  * @param {string} category - Workspace category name.
@@ -120,7 +179,7 @@ export function listWorkspaces() {
  * @param {string} [options.rootDir] - Override path to workspace root.
  * @param {boolean} [options.force=false] - Force re-indexing of all files.
  * @param {number} [options.concurrency=8] - Batch embedding concurrency.
- * @returns {Promise<{ category: string, scanned: number, updated: number, unchanged: number, deleted: number, totalChunks: number, durationMs: number }>}
+ * @returns {Promise<{ category: string, scanned: number, updated: number, unchanged: number, deleted: number, totalChunks: number, compositeHash: string, durationMs: number }>}
  */
 export async function indexWorkspace(category, options = {}) {
   const startTime = Date.now();
@@ -179,7 +238,7 @@ export async function indexWorkspace(category, options = {}) {
     const vectors = await embedBatch(textsToEmbed, { concurrency: options.concurrency || 8 });
 
     // Atomic transaction upsert into SQLite + sqlite-vec + FTS5
-    upsertDocumentWithChunks(normCategory, relPath, currentHash, stat.mtimeMs, chunks, vectors);
+    upsertDocumentWithChunks(normCategory, relPath, currentHash, Math.floor(stat.mtimeMs), chunks, vectors);
     updatedCount++;
   }
 
@@ -204,20 +263,80 @@ export async function indexWorkspace(category, options = {}) {
     unchanged: unchangedCount,
     deleted: deletedCount,
     totalChunks: finalStats.totalChunks,
+    compositeHash: finalStats.compositeHash,
     durationMs
   };
 }
 
 /**
- * Searches a workspace category using hybrid dense + sparse search with RRF.
- * @param {string} category
+ * Searches a single workspace or all registered workspaces using hybrid dense + sparse search with RRF.
+ * If category is 'all' or empty, searches across all registered workspaces.
+ * @param {string} [category='all']
  * @param {string} query
  * @param {object} [options]
+ * @param {boolean} [options.autoSync=false] - Check and update index if files changed.
  * @returns {Promise<{ query: string, category: string, count: number, results: Array<object> }>}
  */
-export async function searchWorkspace(category, query, options = {}) {
-  const normCategory = (category || 'default').trim().toLowerCase();
+export async function searchWorkspace(category = 'all', query, options = {}) {
+  const normCategory = (category || 'all').trim().toLowerCase();
+
+  // Handle multi-workspace search across all registered workspaces
+  if (normCategory === 'all') {
+    const registry = getWorkspacesRegistry();
+    const categories = Object.keys(registry);
+    if (categories.length === 0) {
+      return { query, category: 'all', count: 0, results: [] };
+    }
+
+    if (options.autoSync) {
+      for (const cat of categories) {
+        const { isStale } = await checkWorkspaceStaleness(cat);
+        if (isStale) await indexWorkspace(cat);
+      }
+    }
+
+    return searchMultipleWorkspaces(categories, query, options);
+  }
+
+  // Single workspace search
+  if (options.autoSync) {
+    const { isStale } = await checkWorkspaceStaleness(normCategory);
+    if (isStale) await indexWorkspace(normCategory);
+  }
+
   return hybridSearch(normCategory, query, options);
+}
+
+/**
+ * Executes full RAG (Retrieval-Augmented Generation) on a query.
+ * @param {string} [category='all'] - Workspace category name or 'all'.
+ * @param {string} query - User question.
+ * @param {object} [options]
+ * @returns {Promise<{ answer: string, query: string, category: string, sources: Array<object>, durationMs: number }>}
+ */
+export async function askWorkspace(category = 'all', query, options = {}) {
+  const normCategory = (category || 'all').trim().toLowerCase();
+
+  if (options.autoSync) {
+    if (normCategory === 'all') {
+      const registry = getWorkspacesRegistry();
+      for (const cat of Object.keys(registry)) {
+        const { isStale } = await checkWorkspaceStaleness(cat);
+        if (isStale) await indexWorkspace(cat);
+      }
+    } else {
+      const { isStale } = await checkWorkspaceStaleness(normCategory);
+      if (isStale) await indexWorkspace(normCategory);
+    }
+  }
+
+  return executeRAG({
+    query,
+    category: normCategory,
+    limit: options.limit || 5,
+    llmOptions: options.llmOptions || options,
+    onToken: options.onToken
+  });
 }
 
 /**
@@ -240,4 +359,10 @@ export function getWorkspaceStatus(category) {
   };
 }
 
-export { closeDatabase, closeAllDatabases };
+export {
+  closeDatabase,
+  closeAllDatabases,
+  getCompositeWorkspaceHash,
+  checkLLMHealth,
+  executeRAG
+};

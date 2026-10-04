@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 
@@ -349,7 +350,8 @@ export function bm25Search(category, queryText, limit = 10) {
  */
 export function getChunksByIds(category, chunkIds) {
   if (!chunkIds || chunkIds.length === 0) return new Map();
-  const db = getDatabase(category);
+  const normCategory = (category || 'default').trim().toLowerCase();
+  const db = getDatabase(normCategory);
   const placeholders = chunkIds.map(() => '?').join(',');
   const stmt = db.prepare(`
     SELECT id, doc_path, chunk_index, title, section, line_start, line_end, content
@@ -359,6 +361,7 @@ export function getChunksByIds(category, chunkIds) {
   const rows = stmt.all(...chunkIds);
   const map = new Map();
   for (const r of rows) {
+    r.category = normCategory;
     map.set(r.id, r);
   }
   return map;
@@ -373,12 +376,13 @@ export function getCategoryStats(category) {
   const normCategory = (category || 'default').trim().toLowerCase();
   const dbPath = path.join(WORKSPACES_DIR, `${normCategory}.db`);
   if (!fs.existsSync(dbPath)) {
-    return { category: normCategory, exists: false, totalDocs: 0, totalChunks: 0, dbSizeBytes: 0 };
+    return { category: normCategory, exists: false, totalDocs: 0, totalChunks: 0, dbSizeBytes: 0, compositeHash: '' };
   }
   const db = getDatabase(normCategory);
   const docCount = db.prepare('SELECT count(*) as count FROM documents').get().count;
   const chunkCount = db.prepare('SELECT count(*) as count FROM chunks').get().count;
   const stats = fs.statSync(dbPath);
+  const compositeHash = getCompositeWorkspaceHash(normCategory);
 
   return {
     category: normCategory,
@@ -386,6 +390,48 @@ export function getCategoryStats(category) {
     totalDocs: docCount,
     totalChunks: chunkCount,
     dbSizeBytes: stats.size,
+    compositeHash,
     dbPath
   };
 }
+
+/**
+ * Computes a deterministic composite SHA-256 hash across all indexed documents in a workspace.
+ * @param {string} category
+ * @returns {string}
+ */
+export function getCompositeWorkspaceHash(category) {
+  const normCategory = (category || 'default').trim().toLowerCase();
+  const dbPath = path.join(WORKSPACES_DIR, `${normCategory}.db`);
+  if (!fs.existsSync(dbPath)) return '';
+
+  const db = getDatabase(normCategory);
+  const docs = db.prepare('SELECT path, hash FROM documents ORDER BY path ASC').all();
+  if (docs.length === 0) return '';
+
+  const hasher = crypto.createHash('sha256');
+  for (const doc of docs) {
+    hasher.update(`${doc.path}:${doc.hash}\n`, 'utf8');
+  }
+  return hasher.digest('hex');
+}
+
+/**
+ * Returns a fast Map of document paths to their recorded mtime and hash.
+ * @param {string} category
+ * @returns {Map<string, { mtime: number, hash: string }>}
+ */
+export function getDocumentsStatMap(category) {
+  const normCategory = (category || 'default').trim().toLowerCase();
+  const dbPath = path.join(WORKSPACES_DIR, `${normCategory}.db`);
+  if (!fs.existsSync(dbPath)) return new Map();
+
+  const db = getDatabase(normCategory);
+  const rows = db.prepare('SELECT path, hash, mtime FROM documents').all();
+  const map = new Map();
+  for (const row of rows) {
+    map.set(row.path, { mtime: row.mtime, hash: row.hash });
+  }
+  return map;
+}
+
