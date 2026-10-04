@@ -14,6 +14,7 @@ This roadmap outlines the tasks to evolve **Kensaku** from a basic semantic sear
 | [Task 04](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/tasks/task-04-cross-encoder-reranking.md) | **Stage-2 Batched Cross-Encoder Reranking** | High | [`src/services/searchEngine.js`](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/src/services/searchEngine.js) |
 | [Task 05](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/tasks/task-05-local-slm-generation.md) | **In-Process Local ONNX SLM with Terminal Streaming** | Medium | [`src/services/llmClient.js`](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/src/services/llmClient.js), [`src/workers/llmWorker.js`](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/src/workers/llmWorker.js) |
 | [Task 06](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/tasks/task-06-cli-ux-options.md) | **CLI Flags, First-Run Download UX & Diagnostics** | Medium | [`bin/kensaku.js`](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/bin/kensaku.js), [`src/index.js`](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/src/index.js) |
+| [Task 07](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/tasks/task-07-remote-endpoints-config.md) | **Remote TEI/TGI Endpoints & CLI Config Command** | High | [`src/config.js`](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/src/config.js), [`bin/kensaku.js`](file:///Users/darkoorovchanec/Documents/workplace/playground/oni/kensaku/bin/kensaku.js) |
 
 ---
 
@@ -29,3 +30,6 @@ This roadmap outlines the tasks to evolve **Kensaku** from a basic semantic sear
    - Keep native external providers (Ollama, Anthropic, Gemini, OpenAI) for users wanting GPU acceleration via Ollama or cloud models.
 3. **Streaming UX**:
    - Always stream tokens in real-time to stdout (`process.stdout.write`) rather than buffering responses.
+4. **Hybrid Compute & Zero-Cold-Start Support**:
+   - Run 100% in-process local ONNX by default.
+   - Support persistent remote endpoints for Embeddings (TEI), Reranking (TEI), and Generation (TGI / Ollama) via `kensaku config set` or env vars to eliminate model-loading cold starts on demand.
