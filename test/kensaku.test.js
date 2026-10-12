@@ -12,7 +12,10 @@ import {
   searchWorkspace,
   checkWorkspaceStaleness,
   getCompositeWorkspaceHash,
-  closeAllDatabases
+  closeAllDatabases,
+  resolveLLMConfig,
+  isYoakaiAvailable,
+  checkLLMHealth
 } from '../src/index.js';
 import { reorderLostInTheMiddle, formatContextEnvelopes } from '../src/services/ragEngine.js';
 
@@ -158,5 +161,90 @@ Slowly render the guanciale until crispy before tossing with the al dente pasta.
     assert.ok(envelopes.includes('<document id="1"'));
     assert.ok(envelopes.includes('Chunk A (Best)'));
     assert.ok(envelopes.includes('</context>'));
+  });
+
+  it('correctly detects Yoakai availability on the system', () => {
+    const available = isYoakaiAvailable();
+    // Yoakai is installed in user environment
+    assert.strictEqual(typeof available, 'boolean');
+  });
+
+  it('resolves Yoakai as default fallback when no other provider or API keys are configured', () => {
+    // Save existing env
+    const origProvider = process.env.KENSAKU_LLM_PROVIDER;
+    const origAnthropic = process.env.ANTHROPIC_API_KEY;
+    const origGemini = process.env.GEMINI_API_KEY;
+    const origOpenai = process.env.OPENAI_API_KEY;
+
+    try {
+      delete process.env.KENSAKU_LLM_PROVIDER;
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.OPENAI_API_KEY;
+
+      const config = resolveLLMConfig();
+      if (isYoakaiAvailable()) {
+        assert.strictEqual(config.provider, 'yoakai');
+        // Does not pass hardcoded defaults, allows Yoakai to use its own config
+        assert.strictEqual(config.harness, undefined);
+        assert.strictEqual(config.model, undefined);
+        assert.strictEqual(config.effort, undefined);
+      } else {
+        assert.strictEqual(config.provider, 'ollama');
+      }
+    } finally {
+      if (origProvider) process.env.KENSAKU_LLM_PROVIDER = origProvider;
+      if (origAnthropic) process.env.ANTHROPIC_API_KEY = origAnthropic;
+      if (origGemini) process.env.GEMINI_API_KEY = origGemini;
+      if (origOpenai) process.env.OPENAI_API_KEY = origOpenai;
+    }
+  });
+
+  it('allows prioritizing Yoakai explicitly via options and env variables', () => {
+    const origPrefer = process.env.KENSAKU_PREFER_YOAKAI;
+    const origGemini = process.env.GEMINI_API_KEY;
+
+    try {
+      process.env.GEMINI_API_KEY = 'test_key';
+
+      // 1. Explicit option overrides cloud key
+      const optConfig = resolveLLMConfig({ provider: 'yoakai' });
+      assert.strictEqual(optConfig.provider, 'yoakai');
+
+      // 2. KENSAKU_PREFER_YOAKAI overrides cloud key
+      process.env.KENSAKU_PREFER_YOAKAI = 'true';
+      const envConfig = resolveLLMConfig();
+      assert.strictEqual(envConfig.provider, 'yoakai');
+    } finally {
+      if (origPrefer !== undefined) process.env.KENSAKU_PREFER_YOAKAI = origPrefer;
+      else delete process.env.KENSAKU_PREFER_YOAKAI;
+
+      if (origGemini !== undefined) process.env.GEMINI_API_KEY = origGemini;
+      else delete process.env.GEMINI_API_KEY;
+    }
+  });
+
+  it('forwards custom harness, model, and effort to Yoakai when provided', () => {
+    const config = resolveLLMConfig({
+      provider: 'yoakai',
+      harness: 'claude',
+      model: 'claude-3-7-sonnet',
+      effort: 'high'
+    });
+
+    assert.strictEqual(config.provider, 'yoakai');
+    assert.strictEqual(config.harness, 'claude');
+    assert.strictEqual(config.model, 'claude-3-7-sonnet');
+    assert.strictEqual(config.effort, 'high');
+  });
+
+  it('checks LLM health and reports Yoakai configuration when available', async () => {
+    if (isYoakaiAvailable()) {
+      const health = await checkLLMHealth({ provider: 'yoakai' });
+      assert.strictEqual(health.ok, true);
+      assert.strictEqual(health.provider, 'yoakai');
+      assert.ok(health.harness);
+      assert.ok(health.model);
+    }
   });
 });

@@ -1,5 +1,8 @@
 import { embedText } from '../pipeline/embeddings.js';
 import { knnSearch, bm25Search, getChunksByIds } from '../db/sqliteManager.js';
+import { rerankCandidates, DEFAULT_RERANKER_MODEL } from '../pipeline/reranker.js';
+
+export { rerankCandidates, DEFAULT_RERANKER_MODEL };
 
 const RRF_K = 60; // Standard Reciprocal Rank Fusion constant
 const MIN_SIMILARITY_THRESHOLD = 0.25; // Noise floor for dense embeddings
@@ -161,9 +164,15 @@ export async function hybridSearch(category, query, options = {}) {
   }
 
   // 5. Optional Proximity Merge
-  const finalResults = options.mergeProximity !== false
-    ? mergeNearbyChunks(candidates, 5).slice(0, limit)
-    : candidates.slice(0, limit);
+  const mergedCandidates = options.mergeProximity !== false
+    ? mergeNearbyChunks(candidates, 5)
+    : candidates;
+
+  // 6. Stage-2 Cross-Encoder Reranking
+  const shouldRerank = (options.rerank === true || options.rerankModel || options.customReranker) && options.noRerank !== true;
+  const finalResults = shouldRerank
+    ? await rerankCandidates(cleanQuery, mergedCandidates, { ...options, limit })
+    : mergedCandidates.slice(0, limit);
 
   return {
     query: cleanQuery,
@@ -186,9 +195,9 @@ export async function searchMultipleWorkspaces(categories, query, options = {}) 
     return { query, category: 'all', count: 0, results: [] };
   }
 
-  // Execute in parallel
+  // Execute first-stage retrieval without sub-limiting
   const searchPromises = categories.map((cat) =>
-    hybridSearch(cat, query, { ...options, limit: limit * 2 })
+    hybridSearch(cat, query, { ...options, rerank: false, limit: limit * 2 })
       .catch((err) => {
         console.warn(`[Kensaku] Search failed for workspace "${cat}":`, err.message);
         return { results: [] };
@@ -206,14 +215,20 @@ export async function searchMultipleWorkspaces(categories, query, options = {}) 
   allHits.sort((a, b) => b.score - a.score);
 
   // Apply proximity merge across documents
-  const merged = options.mergeProximity !== false
-    ? mergeNearbyChunks(allHits, 5).slice(0, limit)
-    : allHits.slice(0, limit);
+  const mergedHits = options.mergeProximity !== false
+    ? mergeNearbyChunks(allHits, 5)
+    : allHits;
+
+  // Stage-2 Cross-Encoder Reranking across all combined workspaces
+  const shouldRerank = (options.rerank === true || options.rerankModel || options.customReranker) && options.noRerank !== true;
+  const finalResults = shouldRerank
+    ? await rerankCandidates(query, mergedHits, { ...options, limit })
+    : mergedHits.slice(0, limit);
 
   return {
     query,
     category: categories.length === 1 ? categories[0] : 'all',
-    count: merged.length,
-    results: merged
+    count: finalResults.length,
+    results: finalResults
   };
 }

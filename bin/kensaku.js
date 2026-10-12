@@ -11,7 +11,10 @@ import {
   getWorkspaceStatus,
   checkWorkspaceStaleness,
   closeAllDatabases,
-  checkLLMHealth
+  checkLLMHealth,
+  verifyWorkspaceEmbeddingDimension,
+  renderCitations,
+  rerankCandidates
 } from '../src/index.js';
 import { embedText } from '../src/pipeline/embeddings.js';
 import Database from 'better-sqlite3';
@@ -26,7 +29,7 @@ function printHelp() {
 
 Usage:
   kensaku search "<query>" [workspace <name>] [--limit=<n>] [--no-sync]
-  kensaku ask "<question>" [workspace <name>] [--limit=<n>] [--model=<m>] [--provider=<p>]
+  kensaku ask "<question>" [workspace <name>] [--limit=<n>] [--model=<m>] [--provider=<p>] [--harness=<h>] [--effort=<e>] [--yoakai]
   kensaku add workspace <name> <path>
   kensaku remove workspace <name>
   kensaku index <name> [--force]
@@ -49,7 +52,8 @@ Examples:
   kensaku search "What are good standards for Java?"
   kensaku search "Connection pooling" workspace backend --limit=3
   kensaku ask "How is the storage layer implemented?"
-  kensaku ask "Explain the recipe steps" workspace cooking
+  kensaku ask "Explain the architecture" --harness=agy
+  kensaku ask "Explain the recipe steps" workspace cooking --harness=claude --effort=medium
   kensaku add workspace cooking ./recipes
   kensaku test
 `);
@@ -129,16 +133,69 @@ async function runSelfTest() {
   }
 
   // 5. LLM Provider Reachability
-  process.stdout.write('  5. LLM provider configuration: ');
+  process.stdout.write('  5. LLM generation engine: ');
   try {
     const llmHealth = await checkLLMHealth();
     if (llmHealth.ok) {
-      console.log(`✅ PASS (${llmHealth.provider}: ${llmHealth.model})`);
+      if (llmHealth.provider === 'yoakai') {
+        const harnessInfo = llmHealth.harness ? `harness: ${llmHealth.harness}` : '';
+        const modelInfo = llmHealth.model ? `, model: ${llmHealth.model}` : '';
+        console.log(`✅ PASS (yoakai -> ${harnessInfo}${modelInfo})`);
+      } else {
+        console.log(`✅ PASS (${llmHealth.provider}: ${llmHealth.model})`);
+      }
     } else {
-      console.log(`⚠️  NOT READY (${llmHealth.provider}: ${llmHealth.error || 'unreachable'}. Set ANTHROPIC_API_KEY/OPENAI_API_KEY/GEMINI_API_KEY or start Ollama)`);
+      console.log(`⚠️  NOT READY (${llmHealth.provider}: ${llmHealth.error || 'unreachable'}. Set ANTHROPIC_API_KEY/OPENAI_API_KEY/GEMINI_API_KEY, install Yoakai, or start Ollama)`);
     }
   } catch (err) {
     console.log(`⚠️  WARNING (${err.message})`);
+  }
+
+  // 6. Embedding Dimension Metadata Check
+  process.stdout.write('  6. Embedding dimension metadata governance: ');
+  try {
+    const verified = verifyWorkspaceEmbeddingDimension('default', 'Xenova/all-MiniLM-L6-v2', 384);
+    if (verified.ok && verified.dimension === 384) {
+      console.log(`✅ PASS (enforcing ${verified.dimension}-d model contract)`);
+    } else {
+      throw new Error('Dimension verification failed');
+    }
+  } catch (err) {
+    console.log(`❌ FAIL (${err.message})`);
+    allPassed = false;
+  }
+
+  // 7. Citation Linkifier & Hallucination Filter
+  process.stdout.write('  7. Code-aware citation linkifier & validator: ');
+  try {
+    const mockSources = [{ id: 1, docPath: 'docs/test.md', lineStart: 1, lineEnd: 10, title: 'Test' }];
+    const rendered = renderCitations('Statement [1] with phantom [99]', mockSources);
+    if (rendered.includes('[1](') && !rendered.includes('[99]')) {
+      console.log('✅ PASS (verified links, stripped phantom citations)');
+    } else {
+      throw new Error('Citation linkification failed');
+    }
+  } catch (err) {
+    console.log(`❌ FAIL (${err.message})`);
+    allPassed = false;
+  }
+
+  // 8. Stage-2 Cross-Encoder Reranker Module
+  process.stdout.write('  8. Stage-2 Cross-Encoder reranker readiness: ');
+  try {
+    const mockCandidates = [
+      { id: 1, content: 'Passage one', score: 0.5 },
+      { id: 2, content: 'Passage two', score: 0.8 }
+    ];
+    const skipped = await rerankCandidates('query', mockCandidates, { noRerank: true });
+    if (skipped.length === 2) {
+      console.log('✅ PASS (reranker module active, bypass flag verified)');
+    } else {
+      throw new Error('Reranker module verification failed');
+    }
+  } catch (err) {
+    console.log(`❌ FAIL (${err.message})`);
+    allPassed = false;
   }
 
   console.log(allPassed ? '\n✨ All core systems are operational!\n' : '\n⚠️  Some diagnostics failed. Please inspect the logs above.\n');
@@ -213,6 +270,7 @@ async function main() {
       let workspaceName = 'all'; // Default to all workspaces per idea.md
       let limit = 5;
       let autoSync = true;
+      let rerank = undefined;
 
       for (let i = 2; i < args.length; i++) {
         if (args[i] === 'workspace' && args[i + 1]) {
@@ -224,10 +282,14 @@ async function main() {
           workspaceName = args[i].split('=')[1];
         } else if (args[i] === '--no-sync') {
           autoSync = false;
+        } else if (args[i] === '--no-rerank') {
+          rerank = false;
+        } else if (args[i] === '--rerank') {
+          rerank = true;
         }
       }
 
-      const res = await searchWorkspace(workspaceName, query, { limit, autoSync });
+      const res = await searchWorkspace(workspaceName, query, { limit, autoSync, rerank });
       const scopeLabel = workspaceName === 'all' ? 'all workspaces' : `workspace "${workspaceName}"`;
       console.log(`\n🔍 Found ${res.count} results for "${query}" across ${scopeLabel}:\n`);
 
@@ -257,6 +319,9 @@ async function main() {
       let limit = 5;
       let model = undefined;
       let provider = undefined;
+      let harness = undefined;
+      let effort = undefined;
+      let rerank = undefined;
 
       for (let i = 2; i < args.length; i++) {
         if (args[i] === 'workspace' && args[i + 1]) {
@@ -270,6 +335,18 @@ async function main() {
           model = args[i].split('=')[1];
         } else if (args[i].startsWith('--provider=')) {
           provider = args[i].split('=')[1];
+        } else if (args[i] === '--yoakai') {
+          provider = 'yoakai';
+        } else if (args[i].startsWith('--harness=')) {
+          harness = args[i].split('=')[1];
+        } else if (args[i] === '-H' && args[i + 1]) {
+          harness = args[++i];
+        } else if (args[i].startsWith('--effort=')) {
+          effort = args[i].split('=')[1];
+        } else if (args[i] === '--no-rerank') {
+          rerank = false;
+        } else if (args[i] === '--rerank') {
+          rerank = true;
         }
       }
 
@@ -285,14 +362,18 @@ async function main() {
       try {
         const ragRes = await askWorkspace(workspaceName, prompt, {
           limit,
+          rerank,
           autoSync: true,
-          llmOptions: { model, provider },
+          llmOptions: { model, provider, harness, effort },
           onToken
         });
 
         if (ragRes.sources && ragRes.sources.length > 0) {
           console.log('\n\n' + '─'.repeat(60));
-          console.log(`📚 Grounded Citations & Sources (${ragRes.durationMs}ms via ${ragRes.provider || 'local'}/${ragRes.model || 'model'}):`);
+          const provDisplay = ragRes.provider || 'local';
+          const subInfo = [ragRes.harness, ragRes.model].filter(Boolean).join('/');
+          const engineLabel = subInfo ? `${provDisplay}/${subInfo}` : provDisplay;
+          console.log(`📚 Grounded Citations & Sources (${ragRes.durationMs}ms via ${engineLabel}):`);
           ragRes.sources.forEach((src) => {
             const wsTag = src.workspace ? `[${src.workspace}] ` : '';
             console.log(`  [${src.id}] ${wsTag}${src.docPath}#L${src.lineStart}-L${src.lineEnd} — "${src.section}" (score: ${src.score})`);

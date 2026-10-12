@@ -11,13 +11,17 @@ Kensaku is a zero-external-service semantic search and Retrieval-Augmented Gener
 
 ### 1. Full RAG Execution (Ask a question and get grounded answer with citations)
 ```bash
-# Query all workspaces
+# Query all workspaces (uses Yoakai as default fallback if installed, or configured LLM)
 kensaku ask "How is the storage layer implemented?"
 
 # Query a specific workspace
 kensaku ask "What is the authentic carbonara recipe?" workspace cooking
 
-# Specify an LLM provider and model (supports Ollama, Anthropic, Gemini, OpenAI)
+# Route generation to Yoakai with specific harness or effort
+kensaku ask "Explain the architecture" --harness=agy
+kensaku ask "Compare sqlite-vec with other vector DBs" --harness=claude --effort=high
+
+# Specify an external LLM provider directly (supports Yoakai, Ollama, Anthropic, Gemini, OpenAI)
 kensaku ask "Explain the architecture" workspace dev --provider=anthropic --model=claude-3-5-haiku-20241022
 ```
 

@@ -15,12 +15,16 @@ import {
   deleteDocumentChunks,
   upsertDocumentWithChunks,
   getCategoryStats,
+  getWorkspaceMetadata,
+  setWorkspaceMetadata,
+  verifyWorkspaceEmbeddingDimension,
   closeDatabase,
   closeAllDatabases
 } from './db/sqliteManager.js';
-import { hybridSearch, searchMultipleWorkspaces } from './services/searchEngine.js';
+import { hybridSearch, searchMultipleWorkspaces, rerankCandidates, DEFAULT_RERANKER_MODEL } from './services/searchEngine.js';
 import { executeRAG } from './services/ragEngine.js';
-import { checkLLMHealth } from './services/llmClient.js';
+import { renderCitations, auditCitations, buildSourceUri } from './services/citationRenderer.js';
+import { checkLLMHealth, isYoakaiAvailable, resolveLLMConfig } from './services/llmClient.js';
 
 /**
  * Recursively scans directory for markdown files.
@@ -334,6 +338,8 @@ export async function askWorkspace(category = 'all', query, options = {}) {
     query,
     category: normCategory,
     limit: options.limit || 5,
+    rerank: options.rerank,
+    noRerank: options.noRerank,
     llmOptions: options.llmOptions || options,
     onToken: options.onToken
   });
@@ -362,7 +368,18 @@ export function getWorkspaceStatus(category) {
 export {
   closeDatabase,
   closeAllDatabases,
+  getCategoryStats,
   getCompositeWorkspaceHash,
+  getWorkspaceMetadata,
+  setWorkspaceMetadata,
+  verifyWorkspaceEmbeddingDimension,
+  rerankCandidates,
+  DEFAULT_RERANKER_MODEL,
+  renderCitations,
+  auditCitations,
+  buildSourceUri,
   checkLLMHealth,
+  isYoakaiAvailable,
+  resolveLLMConfig,
   executeRAG
 };

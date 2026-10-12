@@ -1,6 +1,7 @@
 import { hybridSearch, searchMultipleWorkspaces } from './searchEngine.js';
 import { getWorkspacesRegistry } from '../db/sqliteManager.js';
 import { streamCompletion } from './llmClient.js';
+import { renderCitations, auditCitations } from './citationRenderer.js';
 
 /**
  * Reorders candidate chunks to mitigate the "Lost in the Middle" attention phenomenon.
@@ -80,6 +81,8 @@ export async function executeRAG({
   query,
   category = 'all',
   limit = 5,
+  rerank = undefined,
+  noRerank = undefined,
   llmOptions = {},
   onToken = null
 }) {
@@ -93,6 +96,7 @@ export async function executeRAG({
   // 1. Multi-Workspace or Single-Workspace Hybrid Retrieval
   let searchResult;
   const normCategory = (category || 'all').trim().toLowerCase();
+  const searchOpts = { limit, rerank, noRerank, ...llmOptions };
 
   if (normCategory === 'all') {
     const registry = getWorkspacesRegistry();
@@ -108,9 +112,9 @@ export async function executeRAG({
         durationMs: Date.now() - startTime
       };
     }
-    searchResult = await searchMultipleWorkspaces(registeredCategories, cleanQuery, { limit });
+    searchResult = await searchMultipleWorkspaces(registeredCategories, cleanQuery, searchOpts);
   } else {
-    searchResult = await hybridSearch(normCategory, cleanQuery, { limit });
+    searchResult = await hybridSearch(normCategory, cleanQuery, searchOpts);
   }
 
   const rawChunks = searchResult.results || [];
@@ -147,22 +151,36 @@ export async function executeRAG({
 
   const durationMs = Date.now() - startTime;
 
+  const formattedSources = curatedChunks.map((c, i) => ({
+    id: i + 1,
+    workspace: c.workspace,
+    docPath: c.docPath,
+    lineStart: c.lineStart,
+    lineEnd: c.lineEnd,
+    title: c.title,
+    section: c.section,
+    score: c.score
+  }));
+
+  // Linkify citations and strip hallucinated references
+  const linkifiedAnswer = renderCitations(completion.text, formattedSources, {
+    format: llmOptions?.citationFormat || 'markdown',
+    workspaceRoot: llmOptions?.workspaceRoot || null,
+    stripHallucinations: llmOptions?.stripHallucinations !== false
+  });
+
+  const citationAudit = auditCitations(completion.text, formattedSources);
+
   return {
-    answer: completion.text,
+    answer: linkifiedAnswer,
+    rawAnswer: completion.text,
     query: cleanQuery,
     category: normCategory,
     provider: completion.provider,
+    harness: completion.harness,
     model: completion.model,
-    sources: curatedChunks.map((c, i) => ({
-      id: i + 1,
-      workspace: c.workspace,
-      docPath: c.docPath,
-      lineStart: c.lineStart,
-      lineEnd: c.lineEnd,
-      title: c.title,
-      section: c.section,
-      score: c.score
-    })),
+    sources: formattedSources,
+    citations: citationAudit,
     durationMs
   };
 }

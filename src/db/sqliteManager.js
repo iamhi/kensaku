@@ -15,6 +15,9 @@ fs.mkdirSync(WORKSPACES_DIR, { recursive: true });
 // Active DB connection cache
 const dbCache = new Map();
 
+export const DEFAULT_MODEL_NAME = 'Xenova/all-MiniLM-L6-v2';
+export const DEFAULT_EMBEDDING_DIM = 384;
+
 /**
  * Loads the workspace registry.
  * @returns {Record<string, { name: string, path: string, addedAt: string, updatedAt?: string }>}
@@ -104,6 +107,11 @@ export function getDatabase(category) {
 
   // Initialize schema
   db.exec(`
+    CREATE TABLE IF NOT EXISTS workspace_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS documents (
       path TEXT PRIMARY KEY,
       hash TEXT NOT NULL,
@@ -148,8 +156,76 @@ export function getDatabase(category) {
     END;
   `);
 
+  // Ensure default metadata exists
+  const metaStmt = db.prepare('INSERT OR IGNORE INTO workspace_meta (key, value) VALUES (?, ?)');
+  metaStmt.run('model_name', DEFAULT_MODEL_NAME);
+  metaStmt.run('embedding_dim', String(DEFAULT_EMBEDDING_DIM));
+
   dbCache.set(normCategory, db);
   return db;
+}
+
+/**
+ * Retrieves all stored metadata for a workspace.
+ * @param {string} category
+ * @returns {Record<string, string>}
+ */
+export function getWorkspaceMetadata(category) {
+  const normCategory = (category || 'default').trim().toLowerCase();
+  const db = getDatabase(normCategory);
+  const rows = db.prepare('SELECT key, value FROM workspace_meta').all();
+  const meta = {};
+  for (const r of rows) {
+    meta[r.key] = r.value;
+  }
+  return meta;
+}
+
+/**
+ * Sets a metadata key-value pair in a workspace.
+ * @param {string} category
+ * @param {string} key
+ * @param {string|number} value
+ */
+export function setWorkspaceMetadata(category, key, value) {
+  const normCategory = (category || 'default').trim().toLowerCase();
+  const db = getDatabase(normCategory);
+  db.prepare(`
+    INSERT INTO workspace_meta (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(String(key), String(value));
+}
+
+/**
+ * Verifies that the workspace database's vector dimension and embedding model match the current runtime.
+ * Throws an actionable error if there is a dimension mismatch.
+ * @param {string} category
+ * @param {string} [currentModel=DEFAULT_MODEL_NAME]
+ * @param {number} [currentDim=DEFAULT_EMBEDDING_DIM]
+ * @returns {{ ok: boolean, model: string, dimension: number }}
+ */
+export function verifyWorkspaceEmbeddingDimension(category, currentModel = DEFAULT_MODEL_NAME, currentDim = DEFAULT_EMBEDDING_DIM) {
+  const normCategory = (category || 'default').trim().toLowerCase();
+  const meta = getWorkspaceMetadata(normCategory);
+
+  if (!meta.embedding_dim) {
+    setWorkspaceMetadata(normCategory, 'model_name', currentModel);
+    setWorkspaceMetadata(normCategory, 'embedding_dim', currentDim);
+    return { ok: true, model: currentModel, dimension: currentDim };
+  }
+
+  const storedDim = parseInt(meta.embedding_dim, 10);
+  if (storedDim !== currentDim) {
+    throw new Error(
+      `[Kensaku] Dimension mismatch for workspace "${normCategory}": ` +
+      `database was initialized with dimension ${storedDim} (${meta.model_name || 'unknown'}), ` +
+      `but current operation requires dimension ${currentDim} (${currentModel}). ` +
+      `Please re-index workspace "${normCategory}" using: kensaku index ${normCategory} --force`
+    );
+  }
+
+  return { ok: true, model: meta.model_name || currentModel, dimension: storedDim };
 }
 
 /**
@@ -233,6 +309,10 @@ export function deleteDocumentChunks(category, docPath) {
 export function upsertDocumentWithChunks(category, docPath, hash, mtime, chunks, vectors) {
   const db = getDatabase(category);
 
+  if (vectors && vectors.length > 0 && vectors[0]) {
+    verifyWorkspaceEmbeddingDimension(category, DEFAULT_MODEL_NAME, vectors[0].length);
+  }
+
   // Prepared statements
   const findOldChunkIds = db.prepare('SELECT id FROM chunks WHERE doc_path = ?');
   const deleteVec = db.prepare('DELETE FROM chunk_vectors WHERE rowid = ?');
@@ -296,6 +376,11 @@ export function upsertDocumentWithChunks(category, docPath, hash, mtime, chunks,
  */
 export function knnSearch(category, queryVector, limit = 10) {
   const db = getDatabase(category);
+
+  if (queryVector) {
+    verifyWorkspaceEmbeddingDimension(category, DEFAULT_MODEL_NAME, queryVector.length);
+  }
+
   const stmt = db.prepare(`
     SELECT rowid as chunkId, distance
     FROM chunk_vectors
@@ -383,6 +468,7 @@ export function getCategoryStats(category) {
   const chunkCount = db.prepare('SELECT count(*) as count FROM chunks').get().count;
   const stats = fs.statSync(dbPath);
   const compositeHash = getCompositeWorkspaceHash(normCategory);
+  const meta = getWorkspaceMetadata(normCategory);
 
   return {
     category: normCategory,
@@ -391,7 +477,9 @@ export function getCategoryStats(category) {
     totalChunks: chunkCount,
     dbSizeBytes: stats.size,
     compositeHash,
-    dbPath
+    dbPath,
+    embeddingModel: meta.model_name || DEFAULT_MODEL_NAME,
+    embeddingDim: parseInt(meta.embedding_dim || String(DEFAULT_EMBEDDING_DIM), 10)
   };
 }
 
